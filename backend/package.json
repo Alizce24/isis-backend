@@ -1,0 +1,20 @@
+{
+  "name": "isis-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.3.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "fs-extra": "^11.3.5",
+    "leaflet": "^1.9.4",
+    "multer": "^2.1.1",
+    "react-leaflet": "^5.0.0",
+    "sqlite3": "^6.0.1",
+    "tailwindcss": "^4.3.0",
+    "tesseract.js": "^7.0.0"
+  }
+}
