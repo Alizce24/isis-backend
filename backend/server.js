@@ -1,9 +1,3 @@
-/**
- * ISIS Backend – PREP con doble captura asimétrica (humano + IA)
- * Versión mejorada: extraerVotos robusto, validación real, health con disk_free,
- * captura_humana actualizada, manejo de errores resiliente.
- */
-
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -12,8 +6,6 @@ const crypto = require('crypto');
 const tesseract = require('tesseract.js');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-const { execSync } = require('child_process');
-
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -36,8 +28,6 @@ let ocrDisponible = true;
 
 const db = new sqlite3.Database(path.join(__dirname, 'database.sqlite'));
 
-// ─── Helpers de base de datos ────────────────────────────────────────────────
-
 function dbRun(sql, params = []) {
     return new Promise((resolve, reject) => {
         db.run(sql, params, function (err) {
@@ -59,11 +49,68 @@ function dbAll(sql, params = []) {
     });
 }
 
-// ─── Utilidades generales ────────────────────────────────────────────────────
-
 function calcularHash(filePath) {
     const buffer = fs.readFileSync(filePath);
     return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+function extraerVotos(texto) {
+    const numeros = texto.match(/\b\d{2,4}\b/g) || [];
+    const partidos = ['PAN', 'PRI', 'MORENA', 'VERDE', 'PT', 'MC'];
+    const votos = {};
+    for (let i = 0; i < partidos.length && i < numeros.length; i++) {
+        votos[partidos[i]] = parseInt(numeros[i], 10);
+    }
+    const totalMatch = texto.match(/total[^\d]*(\d+)/i);
+    votos.personas_votaron = totalMatch ? parseInt(totalMatch[1], 10) : 0;
+    return votos;
+}
+
+function validarActaIAConsistencia(datos) {
+    const observaciones = [];
+    let confianza = 100;
+    const partidos = ['PAN', 'PRI', 'MORENA', 'VERDE', 'PT', 'MC'];
+
+    for (const partido of partidos) {
+        const valor = datos[partido];
+        if (valor === undefined || valor === null || Number.isNaN(valor)) {
+            observaciones.push(`Falta o es inválido el valor de ${partido}`);
+            confianza -= 12;
+        } else if (valor < 0) {
+            observaciones.push(`${partido} tiene un valor negativo`);
+            confianza -= 15;
+        }
+    }
+
+    const sumaPartidos = partidos.reduce((acc, p) => acc + (Number(datos[p]) || 0), 0);
+    const total = Number(datos.personas_votaron) || 0;
+
+    if (total === 0 && sumaPartidos === 0) {
+        observaciones.push('No se detectaron votos en el acta');
+        confianza -= 30;
+    } else if (total > 0 && sumaPartidos > total) {
+        observaciones.push(
+            `La suma de votos por partido (${sumaPartidos}) supera el total de personas que votaron (${total})`
+        );
+        confianza -= 25;
+    } else if (total > 0 && sumaPartidos < total * 0.5) {
+        observaciones.push(
+            `La suma de votos por partido (${sumaPartidos}) es muy baja respecto al total (${total})`
+        );
+        confianza -= 15;
+    }
+
+    return {
+        confianza: Math.max(0, Math.min(100, confianza)),
+        observaciones
+    };
+}
+
+function datosIdenticos(a, b) {
+    const keysA = Object.keys(a || {}).sort();
+    const keysB = Object.keys(b || {}).sort();
+    if (keysA.length !== keysB.length) return false;
+    return keysA.every((key, i) => key === keysB[i] && a[key] === b[key]);
 }
 
 function parseJsonField(value, fallback = null) {
@@ -98,147 +145,19 @@ function getUsuario(req) {
     return req.body?.usuario || req.headers['x-usuario'] || 'operador-cael';
 }
 
-function datosIdenticos(a, b) {
-    const keysA = Object.keys(a || {}).sort();
-    const keysB = Object.keys(b || {}).sort();
-    if (keysA.length !== keysB.length) return false;
-    return keysA.every((key, i) => key === keysB[i] && a[key] === b[key]);
-}
-
-// ─── Extracción de votos mejorada ─────────────────────────────────────────────
-/**
- * Reconoce partidos por nombre completo o sigla en el texto OCR.
- * Busca el número más cercano a la derecha (o abajo) de cada partido.
- * También detecta votos nulos y candidaturas no registradas.
- * Si no encuentra un partido, asigna null (no 0) para distinguir ausencia.
- */
-function extraerVotos(texto) {
-    // Mapa de alias → clave canónica
-    const ALIAS_PARTIDOS = {
-        PAN: ['PAN', 'PARTIDO ACCION NACIONAL', 'PARTIDO ACCIÓN NACIONAL', 'ACCION NACIONAL'],
-        PRI: ['PRI', 'PARTIDO REVOLUCIONARIO INSTITUCIONAL', 'REVOLUCIONARIO INSTITUCIONAL'],
-        MORENA: ['MORENA', 'MOVIMIENTO REGENERACION NACIONAL', 'MOVIMIENTO REGENERACIÓN NACIONAL'],
-        VERDE: ['VERDE', 'PVEM', 'PARTIDO VERDE ECOLOGISTA', 'VERDE ECOLOGISTA'],
-        PT: ['PT', 'PARTIDO DEL TRABAJO', 'DEL TRABAJO'],
-        MC: ['MC', 'MOVIMIENTO CIUDADANO', 'CIUDADANO'],
-    };
-
-    const textoNorm = texto.toUpperCase().replace(/\s+/g, ' ');
-    const votos = {};
-
-    for (const [partido, aliases] of Object.entries(ALIAS_PARTIDOS)) {
-        let encontrado = null;
-
-        for (const alias of aliases) {
-            // Busca el alias y captura el primer número que aparece tras él (hasta 80 chars)
-            const regex = new RegExp(`${alias}[^\\d]{0,80}?(\\d{1,4})`, 'i');
-            const match = textoNorm.match(regex);
-            if (match) {
-                encontrado = parseInt(match[1], 10);
-                break;
-            }
-        }
-
-        // null indica que el partido no se encontró en el texto (diferente a 0 votos)
-        votos[partido] = encontrado;
-    }
-
-    // Votos nulos: busca "NULOS", "VOTOS NULOS", "NULL"
-    const nulosMatch = textoNorm.match(/(?:VOTOS?\s+)?NULOS?[^\d]{0,30}?(\d{1,4})/);
-    votos.nulos = nulosMatch ? parseInt(nulosMatch[1], 10) : null;
-
-    // Candidaturas no registradas: "NO REGISTRADOS", "NO REG", "CANDIDATURA NO REGISTRADA"
-    const noRegMatch = textoNorm.match(/(?:CANDIDATURA\s+)?NO\s+REGISTRAD[OA]S?[^\d]{0,30}?(\d{1,4})/);
-    votos.no_registrados = noRegMatch ? parseInt(noRegMatch[1], 10) : null;
-
-    // Total de personas que votaron
-    const totalMatch = textoNorm.match(/TOTAL[^\d]{0,40}?(\d{1,4})/);
-    votos.personas_votaron = totalMatch ? parseInt(totalMatch[1], 10) : null;
-
-    return votos;
-}
-
-// ─── Validación de consistencia mejorada ──────────────────────────────────────
-/**
- * Valida que los datos extraídos sean internamente consistentes.
- * Reglas:
- *   1. Ningún partido con valor negativo.
- *   2. Si personas_votaron está presente:
- *        suma_partidos + nulos + no_registrados ≈ personas_votaron
- *   3. Si personas_votaron > 2000, baja confianza (casilla normal).
- *   4. Partidos con null (no encontrados) penalizan confianza levemente.
- */
-function validarActaIAConsistencia(datos) {
-    const observaciones = [];
-    let confianza = 100;
-
-    const PARTIDOS_PRINCIPALES = ['PAN', 'PRI', 'MORENA', 'VERDE', 'PT', 'MC'];
-    const MAX_VOTOS_CASILLA = 2000; // umbral para casilla normal
-
-    // 1. Validar valores individuales
-    for (const partido of PARTIDOS_PRINCIPALES) {
-        const valor = datos[partido];
-        if (valor === undefined || valor === null) {
-            observaciones.push(`No se encontró ${partido} en el texto`);
-            confianza -= 8; // penaliza menos que antes porque puede ser legítimo
-        } else if (Number.isNaN(valor) || valor < 0) {
-            observaciones.push(`${partido} tiene un valor inválido o negativo (${valor})`);
-            confianza -= 15;
-        }
-    }
-
-    // 2. Calcular suma de todos los votos emitidos
-    const sumaPartidos = PARTIDOS_PRINCIPALES.reduce(
-        (acc, p) => acc + (Number(datos[p]) || 0), 0
+async function registrarAuditoria({ acta_id, usuario, accion, datos_previos, datos_nuevos, ip }) {
+    await dbRun(
+        `INSERT INTO auditoria (acta_id, usuario, accion, datos_previos, datos_nuevos, ip) VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+            acta_id,
+            usuario,
+            accion,
+            datos_previos ? JSON.stringify(datos_previos) : null,
+            datos_nuevos ? JSON.stringify(datos_nuevos) : null,
+            ip
+        ]
     );
-    const nulos = Number(datos.nulos) || 0;
-    const noReg = Number(datos.no_registrados) || 0;
-    const sumaTotal = sumaPartidos + nulos + noReg;
-    const totalPersonas = datos.personas_votaron != null ? Number(datos.personas_votaron) : null;
-
-    // 3. Cruzar suma vs total declarado
-    if (totalPersonas !== null && totalPersonas > 0) {
-        if (sumaTotal > totalPersonas) {
-            observaciones.push(
-                `La suma de votos (${sumaTotal}) supera el total de personas que votaron (${totalPersonas})`
-            );
-            confianza -= 30;
-        } else if (sumaTotal < totalPersonas * 0.5 && totalPersonas > 10) {
-            observaciones.push(
-                `La suma de votos (${sumaTotal}) es muy baja vs el total declarado (${totalPersonas})`
-            );
-            confianza -= 20;
-        } else if (sumaTotal !== totalPersonas) {
-            // Diferencia tolerable: podría ser error menor de OCR
-            const diferencia = Math.abs(sumaTotal - totalPersonas);
-            if (diferencia > 5) {
-                observaciones.push(
-                    `Diferencia de ${diferencia} votos entre la suma (${sumaTotal}) y el total (${totalPersonas})`
-                );
-                confianza -= 10;
-            }
-        }
-    } else if (sumaPartidos === 0) {
-        observaciones.push('No se detectaron votos de ningún partido');
-        confianza -= 30;
-    }
-
-    // 4. Umbral de casilla normal
-    const referenciaTotal = totalPersonas ?? sumaTotal;
-    if (referenciaTotal > MAX_VOTOS_CASILLA) {
-        observaciones.push(
-            `Total de votos (${referenciaTotal}) excede el umbral normal de casilla (${MAX_VOTOS_CASILLA})`
-        );
-        confianza -= 20;
-    }
-
-    return {
-        confianza: Math.max(0, Math.min(100, confianza)),
-        observaciones
-    };
 }
-
-// ─── Validación de integridad de archivo ──────────────────────────────────────
 
 function validarIntegridadArchivo(filePath, mimetype) {
     const buf = fs.readFileSync(filePath);
@@ -257,10 +176,7 @@ async function moverACorruptas(filePath, nombre) {
     return dest;
 }
 
-// ─── Pipeline OCR con fallback ────────────────────────────────────────────────
-
 async function procesarOCR(filePath, mimetype) {
-    // PDFs no pasan por OCR de imagen
     if (mimetype === 'application/pdf') {
         return {
             ocr_exitoso: false,
@@ -271,10 +187,8 @@ async function procesarOCR(filePath, mimetype) {
             requiere_verificacion_humana: true
         };
     }
-
     try {
         const { data: { text } } = await tesseract.recognize(filePath, 'spa');
-
         if (!text || text.trim().length < 8) {
             return {
                 ocr_exitoso: false,
@@ -285,11 +199,9 @@ async function procesarOCR(filePath, mimetype) {
                 requiere_verificacion_humana: true
             };
         }
-
         const votos = extraerVotos(text);
         const { confianza, observaciones } = validarActaIAConsistencia(votos);
         const requiere = confianza < 50 || observaciones.length > 2;
-
         return {
             ocr_exitoso: true,
             texto: text,
@@ -299,7 +211,7 @@ async function procesarOCR(filePath, mimetype) {
             requiere_verificacion_humana: requiere
         };
     } catch (err) {
-        console.error('OCR fallback activado:', err.message);
+        console.error('OCR fallback:', err.message);
         ocrDisponible = false;
         return {
             ocr_exitoso: false,
@@ -312,136 +224,84 @@ async function procesarOCR(filePath, mimetype) {
     }
 }
 
-// ─── Auditoría ────────────────────────────────────────────────────────────────
-
-async function registrarAuditoria({ acta_id, usuario, accion, datos_previos, datos_nuevos, ip }) {
-    await dbRun(
-        `INSERT INTO auditoria (acta_id, usuario, accion, datos_previos, datos_nuevos, ip)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-            acta_id,
-            usuario,
-            accion,
-            datos_previos ? JSON.stringify(datos_previos) : null,
-            datos_nuevos ? JSON.stringify(datos_nuevos) : null,
-            ip
-        ]
-    );
-}
-
-async function obtenerCapturas(actaId) {
-    const rows = await dbAll(
-        `SELECT id, acta_id, tipo, datos, timestamp
-         FROM capturas WHERE acta_id = ? ORDER BY timestamp ASC`,
-        [actaId]
-    );
-    return rows.map((row) => ({ ...row, datos: parseJsonField(row.datos, {}) }));
-}
-
-// ─── Inicialización de base de datos ─────────────────────────────────────────
-
 async function initDatabase() {
-    // Tabla principal de actas
     await dbRun(`CREATE TABLE IF NOT EXISTS actas (
-        id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-        hash                        TEXT UNIQUE,
-        imagen_path                 TEXT,
-        metadata                    TEXT,
-        datos_ocr                   TEXT,
-        datos_corregidos            TEXT,
-        ia_confianza                REAL,
-        ia_observaciones            TEXT,
-        captura_humana              TEXT,
-        estado                      TEXT DEFAULT 'pendiente_humano',
-        ocr_exitoso                 INTEGER DEFAULT 1,
-        requiere_verificacion_humana INTEGER DEFAULT 0,
-        created_at                  DATETIME DEFAULT CURRENT_TIMESTAMP
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hash TEXT UNIQUE,
+        imagen_path TEXT,
+        metadata TEXT,
+        datos_ocr TEXT,
+        datos_corregidos TEXT,
+        ia_confianza REAL,
+        ia_observaciones TEXT,
+        estado TEXT DEFAULT 'pendiente_humano',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Tabla de capturas individuales (ia / humano / supervisor)
     await dbRun(`CREATE TABLE IF NOT EXISTS capturas (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        acta_id   INTEGER,
-        tipo      TEXT,    -- 'ia' | 'humano' | 'supervisor'
-        datos     TEXT,    -- JSON string con votos
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        acta_id INTEGER,
+        tipo TEXT,
+        datos TEXT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(acta_id) REFERENCES actas(id)
     )`);
 
-    // Tabla de auditoría
-    await dbRun(`CREATE TABLE IF NOT EXISTS auditoria (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        acta_id      INTEGER,
-        usuario      TEXT,
-        accion       TEXT,
-        datos_previos TEXT,
-        datos_nuevos  TEXT,
-        ip            TEXT,
-        timestamp     DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(acta_id) REFERENCES actas(id)
-    )`);
-
-    // Migraciones seguras: agrega columnas que podrían faltar en bases existentes
     const columnas = await dbAll(`PRAGMA table_info(actas)`);
     const nombres = columnas.map((c) => c.name);
 
-    const migraciones = [
-        ['estado', `ALTER TABLE actas ADD COLUMN estado TEXT DEFAULT 'pendiente_humano'`],
-        ['ia_confianza', `ALTER TABLE actas ADD COLUMN ia_confianza REAL`],
-        ['ia_observaciones', `ALTER TABLE actas ADD COLUMN ia_observaciones TEXT`],
-        ['datos_corregidos', `ALTER TABLE actas ADD COLUMN datos_corregidos TEXT`],
-        ['captura_humana', `ALTER TABLE actas ADD COLUMN captura_humana TEXT`],
-        ['ocr_exitoso', `ALTER TABLE actas ADD COLUMN ocr_exitoso INTEGER DEFAULT 1`],
-        ['requiere_verificacion_humana', `ALTER TABLE actas ADD COLUMN requiere_verificacion_humana INTEGER DEFAULT 0`],
-    ];
-
-    for (const [col, sql] of migraciones) {
-        if (!nombres.includes(col)) {
-            await dbRun(sql);
-            console.log(`Migración aplicada: columna '${col}' agregada a actas`);
+    if (!nombres.includes('estado')) {
+        await dbRun(`ALTER TABLE actas ADD COLUMN estado TEXT DEFAULT 'pendiente_humano'`);
+        if (nombres.includes('verificada')) {
+            await dbRun(`UPDATE actas SET estado = 'verificada' WHERE verificada = 1`);
+            await dbRun(`UPDATE actas SET estado = 'pendiente_humano' WHERE verificada = 0 OR verificada IS NULL`);
         }
     }
-
-    // Migrar estado desde columna 'verificada' si existía
-    if (!nombres.includes('estado') && nombres.includes('verificada')) {
-        await dbRun(`UPDATE actas SET estado = 'verificada' WHERE verificada = 1`);
-        await dbRun(`UPDATE actas SET estado = 'pendiente_humano' WHERE verificada = 0 OR verificada IS NULL`);
+    if (!nombres.includes('ia_confianza')) {
+        await dbRun(`ALTER TABLE actas ADD COLUMN ia_confianza REAL`);
+    }
+    if (!nombres.includes('ia_observaciones')) {
+        await dbRun(`ALTER TABLE actas ADD COLUMN ia_observaciones TEXT`);
+    }
+    if (!nombres.includes('datos_corregidos')) {
+        await dbRun(`ALTER TABLE actas ADD COLUMN datos_corregidos TEXT`);
+    }
+    if (!nombres.includes('ocr_exitoso')) {
+        await dbRun(`ALTER TABLE actas ADD COLUMN ocr_exitoso INTEGER DEFAULT 1`);
+    }
+    if (!nombres.includes('requiere_verificacion_humana')) {
+        await dbRun(`ALTER TABLE actas ADD COLUMN requiere_verificacion_humana INTEGER DEFAULT 0`);
     }
 
-    // Índices para mejorar rendimiento en consultas frecuentes
-    await dbRun(`CREATE INDEX IF NOT EXISTS idx_actas_estado   ON actas(estado)`);
-    await dbRun(`CREATE INDEX IF NOT EXISTS idx_actas_hash     ON actas(hash)`);
-    await dbRun(`CREATE INDEX IF NOT EXISTS idx_capturas_acta  ON capturas(acta_id)`);
+    await dbRun(`CREATE TABLE IF NOT EXISTS auditoria (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        acta_id INTEGER,
+        usuario TEXT,
+        accion TEXT,
+        datos_previos TEXT,
+        datos_nuevos TEXT,
+        ip TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(acta_id) REFERENCES actas(id)
+    )`);
+
+    await dbRun(`CREATE INDEX IF NOT EXISTS idx_actas_estado ON actas(estado)`);
+    await dbRun(`CREATE INDEX IF NOT EXISTS idx_actas_hash ON actas(hash)`);
     await dbRun(`CREATE INDEX IF NOT EXISTS idx_auditoria_acta ON auditoria(acta_id)`);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// ENDPOINTS
-// ════════════════════════════════════════════════════════════════════════════
+async function obtenerCapturas(actaId) {
+    const rows = await dbAll(
+        `SELECT id, acta_id, tipo, datos, timestamp FROM capturas WHERE acta_id = ? ORDER BY timestamp ASC`,
+        [actaId]
+    );
+    return rows.map((row) => ({
+        ...row,
+        datos: parseJsonField(row.datos, {})
+    }));
+}
 
-// GET / — índice de la API
-app.get('/', (req, res) => {
-    res.json({
-        nombre: 'ISIS Backend API',
-        version: '2.0',
-        frontend: 'http://localhost:5173',
-        endpoints: {
-            estadisticas: 'GET  /api/estadisticas',
-            actas: 'GET  /api/actas[?estado=]',
-            pendientes: 'GET  /api/actas/pendientes?tipo=humano|conflicto',
-            subirActa: 'POST /api/actas',
-            capturaHumana: 'POST /api/actas/:id/captura-humana',
-            detalle: 'GET  /api/actas/:id/detalle',
-            resolverConflicto: 'POST /api/actas/:id/resolver-conflicto',
-            verificarPublica: 'GET  /api/actas/verificar-publica/:hash',
-            auditoria: 'GET  /api/auditoria/:acta_id',
-            health: 'GET  /api/health',
-            seed: 'POST /api/seed',
-        },
-    });
-});
-
-// ─── POST /api/actas — subida de imagen + OCR + captura IA ───────────────────
+// POST /api/actas — subida + OCR con fallback + captura IA
 app.post('/api/actas', upload.single('imagen'), async (req, res) => {
     const ip = getClientIp(req);
     const usuario = getUsuario(req);
@@ -450,7 +310,6 @@ app.post('/api/actas', upload.single('imagen'), async (req, res) => {
     try {
         if (!imagenFile) return res.status(400).json({ error: 'No se recibió archivo' });
 
-        // Validar que el archivo no esté corrupto
         if (!validarIntegridadArchivo(imagenFile.path, imagenFile.mimetype)) {
             const corruptName = `corrupt_${Date.now()}_${imagenFile.originalname || 'archivo'}`;
             await moverACorruptas(imagenFile.path, corruptName);
@@ -463,41 +322,36 @@ app.post('/api/actas', upload.single('imagen'), async (req, res) => {
 
         const metadata = JSON.parse(req.body.metadata || '{}');
         const hash = calcularHash(imagenFile.path);
-        const ext = path.extname(imagenFile.originalname || '') ||
-            (imagenFile.mimetype === 'application/pdf' ? '.pdf' : '.jpg');
+        const ext = path.extname(imagenFile.originalname || '') || (imagenFile.mimetype === 'application/pdf' ? '.pdf' : '.jpg');
         const imageName = `${hash.slice(0, 16)}${ext}`;
         const finalPath = path.join(__dirname, 'uploads', imageName);
         await fs.move(imagenFile.path, finalPath, { overwrite: true });
         imagenFile = { ...imagenFile, path: finalPath };
 
-        // OCR con fallback: si falla, guarda acta igualmente con datos_ocr = null
         const ocr = await procesarOCR(finalPath, imagenFile.mimetype);
-        const votosOCR = ocr.ocr_exitoso ? ocr.votos : null;
+        const votosOCR = ocr.votos;
 
         const result = await dbRun(
-            `INSERT INTO actas
-             (hash, imagen_path, metadata, datos_ocr, ia_confianza, ia_observaciones,
-              ocr_exitoso, requiere_verificacion_humana, estado)
+            `INSERT INTO actas (hash, imagen_path, metadata, datos_ocr, ia_confianza, ia_observaciones,
+             ocr_exitoso, requiere_verificacion_humana, estado)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pendiente_humano')`,
             [
                 hash,
                 imageName,
                 JSON.stringify(metadata),
-                votosOCR ? JSON.stringify(votosOCR) : null,
+                JSON.stringify(votosOCR),
                 ocr.confianza,
                 JSON.stringify(ocr.observaciones),
                 ocr.ocr_exitoso ? 1 : 0,
-                ocr.requiere_verificacion_humana ? 1 : 0,
+                ocr.requiere_verificacion_humana ? 1 : 0
             ]
         );
 
         const actaId = result.lastID;
-
-        // Registrar captura IA en tabla capturas (aunque sea vacía, para trazabilidad)
-        await dbRun(
-            `INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'ia', ?)`,
-            [actaId, JSON.stringify(votosOCR ?? {})]
-        );
+        await dbRun(`INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'ia', ?)`, [
+            actaId,
+            JSON.stringify(votosOCR)
+        ]);
 
         await registrarAuditoria({
             acta_id: actaId,
@@ -522,19 +376,18 @@ app.post('/api/actas', upload.single('imagen'), async (req, res) => {
             modo_degradado: !ocr.ocr_exitoso
         });
     } catch (err) {
-        // Mover imagen a corruptas si el error no fue por duplicado
         if (imagenFile?.path && fs.existsSync(imagenFile.path)) {
             await moverACorruptas(imagenFile.path, `error_${Date.now()}`).catch(() => { });
         }
         if (err.message?.includes('UNIQUE')) {
             return res.status(409).json({ error: 'Esta imagen ya fue registrada (hash duplicado)' });
         }
-        console.error('POST /api/actas error:', err);
-        res.status(500).json({ error: err.message || 'Error interno del servidor' });
+        console.error(err);
+        res.status(500).json({ error: err.message || 'Server error' });
     }
 });
 
-// ─── GET /api/actas — listado con filtro opcional por estado ─────────────────
+// GET /api/actas — listado con filtro opcional por estado
 app.get('/api/actas', async (req, res) => {
     try {
         const { estado } = req.query;
@@ -555,164 +408,66 @@ app.get('/api/actas', async (req, res) => {
     }
 });
 
-// ─── GET /api/actas/pendientes?tipo=humano|conflicto ─────────────────────────
-app.get('/api/actas/pendientes', async (req, res) => {
+// POST /api/seed — datos demo para hackathon
+app.post('/api/seed', async (req, res) => {
     try {
-        const { tipo } = req.query;
-        let estado;
-        if (tipo === 'humano') estado = 'pendiente_humano';
-        else if (tipo === 'conflicto') estado = 'conflicto';
-        else return res.status(400).json({ error: "Query 'tipo' debe ser 'humano' o 'conflicto'" });
+        const demos = [
+            {
+                hash: 'seed_chihuahua_' + Date.now(),
+                metadata: { municipio: 'Chihuahua', seccion: '1234', tipo: 'Básica', numero: '1' },
+                datos: { PAN: 245, PRI: 198, MORENA: 312, VERDE: 45, PT: 22, MC: 67, personas_votaron: 889 },
+                coords: [28.6353, -106.0889]
+            },
+            {
+                hash: 'seed_juarez_' + Date.now(),
+                metadata: { municipio: 'Juárez', seccion: '2156', tipo: 'Básica', numero: '3' },
+                datos: { PAN: 412, PRI: 287, MORENA: 521, VERDE: 38, PT: 15, MC: 94, personas_votaron: 1367 },
+                coords: [31.6904, -106.4245]
+            },
+            {
+                hash: 'seed_cuauhtemoc_' + Date.now(),
+                metadata: { municipio: 'Cuauhtémoc', seccion: '0892', tipo: 'Contigua 1', numero: '2' },
+                datos: { PAN: 178, PRI: 156, MORENA: 203, VERDE: 28, PT: 11, MC: 42, personas_votaron: 618 },
+                coords: [28.4066, -106.8653]
+            }
+        ];
 
-        const rows = await dbAll(
-            `SELECT id, hash, imagen_path, metadata, datos_ocr, ia_confianza, ia_observaciones,
-                    ocr_exitoso, requiere_verificacion_humana, estado, created_at
-             FROM actas WHERE estado = ? ORDER BY created_at ASC`,
-            [estado]
-        );
-        res.json(rows.map(actaConUrls));
+        const insertados = [];
+        for (const demo of demos) {
+            const { confianza, observaciones } = validarActaIAConsistencia(demo.datos);
+            const result = await dbRun(
+                `INSERT INTO actas (hash, imagen_path, metadata, datos_ocr, datos_corregidos,
+                 ia_confianza, ia_observaciones, estado)
+                 VALUES (?, '', ?, ?, ?, ?, ?, 'verificada')`,
+                [
+                    demo.hash,
+                    JSON.stringify({ ...demo.metadata, lat: demo.coords[0], lng: demo.coords[1] }),
+                    JSON.stringify(demo.datos),
+                    JSON.stringify(demo.datos),
+                    confianza,
+                    JSON.stringify(observaciones)
+                ]
+            );
+            const actaId = result.lastID;
+            await dbRun(`INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'ia', ?)`, [
+                actaId,
+                JSON.stringify(demo.datos)
+            ]);
+            await dbRun(`INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'humano', ?)`, [
+                actaId,
+                JSON.stringify(demo.datos)
+            ]);
+            insertados.push({ id: actaId, hash: demo.hash, municipio: demo.metadata.municipio });
+        }
+
+        res.json({ success: true, insertados: insertados.length, actas: insertados });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// ─── POST /api/actas/:id/captura-humana ──────────────────────────────────────
-/**
- * Recibe los votos capturados por el operador humano y los compara con el OCR.
- * - Si coinciden exactamente → estado = 'verificada'
- * - Si difieren             → estado = 'conflicto'
- * Actualiza también la columna captura_humana en actas.
- */
-app.post('/api/actas/:id/captura-humana', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { datos } = req.body;
-
-        if (!datos || typeof datos !== 'object') {
-            return res.status(400).json({ error: 'Se requiere el objeto "datos"' });
-        }
-
-        const acta = await dbGet(`SELECT * FROM actas WHERE id = ?`, [id]);
-        if (!acta) return res.status(404).json({ error: 'Acta no encontrada' });
-
-        if (acta.estado !== 'pendiente_humano') {
-            return res.status(409).json({
-                error: 'Esta acta ya tiene una captura humana registrada',
-                estado_actual: acta.estado
-            });
-        }
-
-        const datosOCR = parseJsonField(acta.datos_ocr, {});
-        const coinciden = datosIdenticos(datosOCR, datos);
-        const nuevoEstado = coinciden ? 'verificada' : 'conflicto';
-
-        // Guardar captura humana en tabla capturas
-        await dbRun(
-            `INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'humano', ?)`,
-            [id, JSON.stringify(datos)]
-        );
-
-        // Actualizar estado Y columna captura_humana en actas
-        await dbRun(
-            `UPDATE actas SET estado = ?, captura_humana = ? WHERE id = ?`,
-            [nuevoEstado, JSON.stringify(datos), id]
-        );
-
-        await registrarAuditoria({
-            acta_id: id,
-            usuario: getUsuario(req),
-            accion: 'verificacion',
-            datos_previos: datosOCR,
-            datos_nuevos: datos,
-            ip: getClientIp(req)
-        });
-
-        res.json({
-            success: true,
-            estado: nuevoEstado,
-            coinciden,
-            mensaje: coinciden
-                ? 'Captura humana coincide con OCR — acta verificada'
-                : 'Captura humana difiere del OCR — conflicto registrado'
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ─── GET /api/actas/:id/detalle ───────────────────────────────────────────────
-app.get('/api/actas/:id/detalle', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const acta = await dbGet(`SELECT * FROM actas WHERE id = ?`, [id]);
-        if (!acta) return res.status(404).json({ error: 'Acta no encontrada' });
-
-        const capturas = await obtenerCapturas(id);
-        res.json({ acta: actaConUrls(acta), capturas });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ─── POST /api/actas/:id/resolver-conflicto ───────────────────────────────────
-/**
- * Solo accesible si estado = 'conflicto'.
- * El supervisor proporciona los datos_finales definitivos.
- */
-app.post('/api/actas/:id/resolver-conflicto', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { datos_finales } = req.body;
-
-        if (!datos_finales || typeof datos_finales !== 'object') {
-            return res.status(400).json({ error: 'Se requiere el objeto "datos_finales"' });
-        }
-
-        const acta = await dbGet(`SELECT * FROM actas WHERE id = ?`, [id]);
-        if (!acta) return res.status(404).json({ error: 'Acta no encontrada' });
-
-        if (acta.estado !== 'conflicto') {
-            return res.status(409).json({
-                error: 'Solo se pueden resolver actas en estado conflicto',
-                estado_actual: acta.estado
-            });
-        }
-
-        await dbRun(
-            `INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'supervisor', ?)`,
-            [id, JSON.stringify(datos_finales)]
-        );
-
-        await dbRun(
-            `UPDATE actas SET estado = 'verificada', datos_corregidos = ? WHERE id = ?`,
-            [JSON.stringify(datos_finales), id]
-        );
-
-        await registrarAuditoria({
-            acta_id: id,
-            usuario: getUsuario(req),
-            accion: 'correccion',
-            datos_previos: parseJsonField(acta.datos_ocr, {}),
-            datos_nuevos: datos_finales,
-            ip: getClientIp(req)
-        });
-
-        res.json({
-            success: true,
-            estado: 'verificada',
-            datos_corregidos: datos_finales,
-            mensaje: 'Conflicto resuelto por supervisor'
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ─── GET /api/actas/verificar-publica/:hash — transparencia ciudadana ─────────
+// GET /api/actas/verificar-publica/:hash — transparencia ciudadana
 app.get('/api/actas/verificar-publica/:hash', async (req, res) => {
     try {
         const acta = await dbGet(`SELECT * FROM actas WHERE hash = ?`, [req.params.hash]);
@@ -745,77 +500,26 @@ app.get('/api/actas/verificar-publica/:hash', async (req, res) => {
     }
 });
 
-// ─── GET /api/estadisticas ────────────────────────────────────────────────────
-app.get('/api/estadisticas', async (req, res) => {
-    try {
-        const row = await dbGet(`
-            SELECT
-                (SELECT COUNT(*) FROM actas)                              AS total,
-                (SELECT COUNT(*) FROM actas WHERE estado = 'verificada') AS verificadas,
-                (SELECT COUNT(*) FROM actas WHERE estado = 'pendiente_humano') AS pendientes_humano,
-                (SELECT COUNT(*) FROM actas WHERE estado = 'conflicto') AS conflictos
-        `);
-        res.json(row);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ─── GET /api/auditoria/:acta_id ──────────────────────────────────────────────
-app.get('/api/auditoria/:acta_id', async (req, res) => {
-    try {
-        const rows = await dbAll(
-            `SELECT id, acta_id, usuario, accion, datos_previos, datos_nuevos, ip, timestamp
-             FROM auditoria WHERE acta_id = ? ORDER BY timestamp ASC`,
-            [req.params.acta_id]
-        );
-        res.json(rows.map((r) => ({
-            ...r,
-            datos_previos: parseJsonField(r.datos_previos),
-            datos_nuevos: parseJsonField(r.datos_nuevos)
-        })));
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ─── GET /api/health ─────────────────────────────────────────────────────────
-/**
- * Semáforo del sistema: DB, OCR y espacio en disco.
- * disk_free se obtiene con `df` (disponible en Linux/macOS).
- */
+// GET /api/health — semáforo del sistema
 app.get('/api/health', async (req, res) => {
     try {
         await dbGet('SELECT 1');
+        const uploadsPath = path.join(__dirname, 'uploads');
+        const stat = await fs.stat(uploadsPath);
+        const espacioOk = stat.isDirectory();
 
-        // Espacio libre en disco donde viven los uploads (en bytes)
-        let diskFreeBytes = null;
-        try {
-            const uploadsPath = path.join(__dirname, 'uploads');
-            const dfOutput = execSync(`df -k "${uploadsPath}" | tail -1`).toString().trim();
-            const parts = dfOutput.split(/\s+/);
-            // df -k columna 3 = bloques disponibles (1K-blocks)
-            diskFreeBytes = parseInt(parts[3], 10) * 1024;
-        } catch {
-            diskFreeBytes = null; // no disponible en este entorno
-        }
-
-        const diskOk = diskFreeBytes === null || diskFreeBytes > 100 * 1024 * 1024; // > 100 MB
-        const estado = ocrDisponible && diskOk ? 'ok'
-            : ocrDisponible || diskOk ? 'degradado'
-                : 'critico';
+        const estado =
+            ocrDisponible && espacioOk ? 'ok' : ocrDisponible || espacioOk ? 'degradado' : 'critico';
 
         res.json({
             estado,
             db: 'ok',
             ocr: ocrDisponible ? 'ok' : 'degradado',
-            almacenamiento: diskOk ? 'ok' : 'bajo',
-            disk_free_bytes: diskFreeBytes,
-            disk_free_mb: diskFreeBytes !== null ? Math.round(diskFreeBytes / (1024 * 1024)) : null,
-            mensaje: estado === 'ok'
-                ? 'Sistema operativo'
-                : 'Modo degradado: verificación manual requerida en algunos casos'
+            almacenamiento: espacioOk ? 'ok' : 'error',
+            mensaje:
+                estado === 'ok'
+                    ? 'Sistema operativo'
+                    : 'Modo degradado: verificación manual requerida en algunos casos'
         });
     } catch (err) {
         res.status(503).json({
@@ -827,58 +531,210 @@ app.get('/api/health', async (req, res) => {
     }
 });
 
-// ─── POST /api/seed — datos demo para hackathon ───────────────────────────────
-app.post('/api/seed', async (req, res) => {
+// GET /api/auditoria/:acta_id
+app.get('/api/auditoria/:acta_id', async (req, res) => {
     try {
-        const demos = [
-            {
-                hash: 'seed_chihuahua_' + Date.now(),
-                metadata: { municipio: 'Chihuahua', seccion: '1234', tipo: 'Básica', numero: '1', lat: 28.6353, lng: -106.0889 },
-                datos: { PAN: 245, PRI: 198, MORENA: 312, VERDE: 45, PT: 22, MC: 67, nulos: 12, no_registrados: 3, personas_votaron: 904 }
-            },
-            {
-                hash: 'seed_juarez_' + Date.now(),
-                metadata: { municipio: 'Juárez', seccion: '2156', tipo: 'Básica', numero: '3', lat: 31.6904, lng: -106.4245 },
-                datos: { PAN: 412, PRI: 287, MORENA: 521, VERDE: 38, PT: 15, MC: 94, nulos: 8, no_registrados: 2, personas_votaron: 1377 }
-            },
-            {
-                hash: 'seed_cuauhtemoc_' + Date.now(),
-                metadata: { municipio: 'Cuauhtémoc', seccion: '0892', tipo: 'Contigua 1', numero: '2', lat: 28.4066, lng: -106.8653 },
-                datos: { PAN: 178, PRI: 156, MORENA: 203, VERDE: 28, PT: 11, MC: 42, nulos: 5, no_registrados: 1, personas_votaron: 624 }
-            }
-        ];
+        const rows = await dbAll(
+            `SELECT id, acta_id, usuario, accion, datos_previos, datos_nuevos, ip, timestamp
+             FROM auditoria WHERE acta_id = ? ORDER BY timestamp ASC`,
+            [req.params.acta_id]
+        );
+        res.json(
+            rows.map((r) => ({
+                ...r,
+                datos_previos: parseJsonField(r.datos_previos),
+                datos_nuevos: parseJsonField(r.datos_nuevos)
+            }))
+        );
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
-        const insertados = [];
-        for (const demo of demos) {
-            const { confianza, observaciones } = validarActaIAConsistencia(demo.datos);
-            const result = await dbRun(
-                `INSERT INTO actas
-                 (hash, imagen_path, metadata, datos_ocr, datos_corregidos,
-                  ia_confianza, ia_observaciones, estado)
-                 VALUES (?, '', ?, ?, ?, ?, ?, 'verificada')`,
-                [
-                    demo.hash,
-                    JSON.stringify(demo.metadata),
-                    JSON.stringify(demo.datos),
-                    JSON.stringify(demo.datos),
-                    confianza,
-                    JSON.stringify(observaciones)
-                ]
-            );
-            const actaId = result.lastID;
-            await dbRun(`INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'ia', ?)`, [actaId, JSON.stringify(demo.datos)]);
-            await dbRun(`INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'humano', ?)`, [actaId, JSON.stringify(demo.datos)]);
-            insertados.push({ id: actaId, hash: demo.hash, municipio: demo.metadata.municipio });
-        }
+// GET /api/actas/pendientes?tipo=humano|conflicto
+app.get('/api/actas/pendientes', async (req, res) => {
+    try {
+        const { tipo } = req.query;
+        let estado;
+        if (tipo === 'humano') estado = 'pendiente_humano';
+        else if (tipo === 'conflicto') estado = 'conflicto';
+        else return res.status(400).json({ error: "Query 'tipo' debe ser 'humano' o 'conflicto'" });
 
-        res.json({ success: true, insertados: insertados.length, actas: insertados });
+        const rows = await dbAll(
+            `SELECT id, hash, imagen_path, metadata, datos_ocr, ia_confianza, ia_observaciones,
+                    ocr_exitoso, requiere_verificacion_humana, estado, created_at
+             FROM actas WHERE estado = ? ORDER BY created_at ASC`,
+            [estado]
+        );
+
+        res.json(rows.map(actaConUrls));
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// ─── Middleware de errores de multer ──────────────────────────────────────────
+// POST /api/actas/:id/captura-humana
+app.post('/api/actas/:id/captura-humana', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { datos } = req.body;
+
+        if (!datos || typeof datos !== 'object') {
+            return res.status(400).json({ error: 'Se requiere el objeto "datos"' });
+        }
+
+        const acta = await dbGet(`SELECT * FROM actas WHERE id = ?`, [id]);
+        if (!acta) return res.status(404).json({ error: 'Acta no encontrada' });
+
+        if (acta.estado !== 'pendiente_humano') {
+            return res.status(409).json({
+                error: 'Esta acta ya tiene una captura humana registrada',
+                estado_actual: acta.estado
+            });
+        }
+
+        const datosOCR = parseJsonField(acta.datos_ocr, {});
+        const coinciden = datosIdenticos(datosOCR, datos);
+        const nuevoEstado = coinciden ? 'verificada' : 'conflicto';
+
+        await dbRun(`INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'humano', ?)`, [
+            id,
+            JSON.stringify(datos)
+        ]);
+
+        await dbRun(`UPDATE actas SET estado = ? WHERE id = ?`, [nuevoEstado, id]);
+
+        await registrarAuditoria({
+            acta_id: id,
+            usuario: getUsuario(req),
+            accion: 'verificacion',
+            datos_previos: datosOCR,
+            datos_nuevos: datos,
+            ip: getClientIp(req)
+        });
+
+        res.json({
+            success: true,
+            estado: nuevoEstado,
+            coinciden,
+            mensaje: coinciden
+                ? 'Captura humana coincide con OCR — acta verificada'
+                : 'Captura humana difiere del OCR — conflicto registrado'
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/actas/:id/detalle
+app.get('/api/actas/:id/detalle', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const acta = await dbGet(`SELECT * FROM actas WHERE id = ?`, [id]);
+        if (!acta) return res.status(404).json({ error: 'Acta no encontrada' });
+
+        const capturas = await obtenerCapturas(id);
+
+        res.json({
+            acta: actaConUrls(acta),
+            capturas
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/actas/:id/resolver-conflicto
+app.post('/api/actas/:id/resolver-conflicto', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { datos_finales } = req.body;
+
+        if (!datos_finales || typeof datos_finales !== 'object') {
+            return res.status(400).json({ error: 'Se requiere el objeto "datos_finales"' });
+        }
+
+        const acta = await dbGet(`SELECT * FROM actas WHERE id = ?`, [id]);
+        if (!acta) return res.status(404).json({ error: 'Acta no encontrada' });
+
+        if (acta.estado !== 'conflicto') {
+            return res.status(409).json({
+                error: 'Solo se pueden resolver actas en estado conflicto',
+                estado_actual: acta.estado
+            });
+        }
+
+        await dbRun(`INSERT INTO capturas (acta_id, tipo, datos) VALUES (?, 'supervisor', ?)`, [
+            id,
+            JSON.stringify(datos_finales)
+        ]);
+
+        await dbRun(
+            `UPDATE actas SET estado = 'verificada', datos_corregidos = ? WHERE id = ?`,
+            [JSON.stringify(datos_finales), id]
+        );
+
+        await registrarAuditoria({
+            acta_id: id,
+            usuario: getUsuario(req),
+            accion: 'correccion',
+            datos_previos: parseJsonField(acta.datos_ocr, {}),
+            datos_nuevos: datos_finales,
+            ip: getClientIp(req)
+        });
+
+        res.json({
+            success: true,
+            estado: 'verificada',
+            datos_corregidos: datos_finales,
+            mensaje: 'Conflicto resuelto por supervisor'
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET / — info (evita "Cannot GET /" al abrir el navegador)
+app.get('/', (req, res) => {
+    res.json({
+        nombre: 'ISIS Backend API',
+        version: '1.0',
+        frontend: 'http://localhost:5173',
+        endpoints: {
+            estadisticas: 'GET /api/estadisticas',
+            actas: 'GET /api/actas',
+            pendientes: 'GET /api/actas/pendientes?tipo=humano|conflicto',
+            subirActa: 'POST /api/actas',
+            capturaHumana: 'POST /api/actas/:id/captura-humana',
+            detalle: 'GET /api/actas/:id/detalle',
+            resolverConflicto: 'POST /api/actas/:id/resolver-conflicto',
+            verificarPublica: 'GET /api/actas/verificar-publica/:hash',
+            auditoria: 'GET /api/auditoria/:acta_id',
+            health: 'GET /api/health',
+            seed: 'POST /api/seed',
+        },
+    });
+});
+
+// GET /api/estadisticas
+app.get('/api/estadisticas', async (req, res) => {
+    try {
+        const row = await dbGet(`SELECT
+            (SELECT COUNT(*) FROM actas) AS total,
+            (SELECT COUNT(*) FROM actas WHERE estado = 'verificada') AS verificadas,
+            (SELECT COUNT(*) FROM actas WHERE estado = 'pendiente_humano') AS pendientes_humano,
+            (SELECT COUNT(*) FROM actas WHERE estado = 'conflicto') AS conflictos`);
+        res.json(row);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.use((err, req, res, next) => {
     if (err instanceof multer.MulterError || err.message?.includes('Solo JPG')) {
         return res.status(400).json({ error: err.message });
@@ -886,10 +742,9 @@ app.use((err, req, res, next) => {
     next(err);
 });
 
-// ─── Arranque ─────────────────────────────────────────────────────────────────
 initDatabase()
     .then(() => {
-        app.listen(3000, () => console.log('ISIS Backend en http://localhost:3000'));
+        app.listen(3000, () => console.log('Backend en http://localhost:3000/api'));
     })
     .catch((err) => {
         console.error('Error al inicializar la base de datos:', err);
